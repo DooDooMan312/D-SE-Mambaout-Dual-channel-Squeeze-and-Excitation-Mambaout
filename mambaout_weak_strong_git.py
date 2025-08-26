@@ -5,6 +5,9 @@ timm (https://github.com/rwightman/pytorch-image-models),
 MetaFormer (https://github.com/sail-sg/metaformer),
 InceptionNeXt (https://github.com/sail-sg/inceptionnext)
 """
+
+
+
 from functools import partial
 import torch
 import torch.nn as nn
@@ -13,17 +16,6 @@ from timm.models.layers import trunc_normal_, DropPath
 from timm.models.registry import register_model
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torch.nn import init
-
-
-def _cfg(url='', **kwargs):
-    return {
-        'url': url,
-        'num_classes': 3, 'input_size': (1, 224, 224), 'pool_size': None,
-        'crop_pct': 1.0, 'interpolation': 'bicubic',
-        'mean': (0.5, 0.5, 0.5), 'std': IMAGENET_DEFAULT_STD, 'classifier': 'head',
-        **kwargs
-    }
-
 
 class StemLayer(nn.Module):
     r""" Code modified from InternImage:
@@ -42,9 +34,7 @@ class StemLayer(nn.Module):
                                kernel_size=3,
                                stride=2,
                                padding=1)
-                # C: 3 --> 48
-                ## in_channels = 3, out_channels = 48
-                ## output_height = (input_height -3 + 2)/2 + 1
+
         self.norm1 = norm_layer(out_channels // 2) #  channels = 48
         self.act = act_layer()  # LayerNorm(eps=1e-6)  # channels = 48
         self.conv2 = nn.Conv2d(out_channels // 2,
@@ -52,19 +42,18 @@ class StemLayer(nn.Module):
                                kernel_size=3,
                                stride=2,
                                padding=1)
-                # C: 48 --> 64
-                ## in_channels = 48, out_channels = 64
-                ## out_height = (output - 3 + 2)/2 + 1
+
         self.norm2 = norm_layer(out_channels)  # channels = 64
 
     def forward(self, x):
-
+        ## output_height = (224 -3 + 2)/2 + 1 = (111.5)向下取整 + 1 = 112
         x = self.conv1(x) # (32, 3, 224, 224) --> (32, 48, 112, 112)✅ 1
         x = x.permute(0, 2, 3, 1) # (B, C, H, W) --> (B, H, W, C) == (32, 112, 112, 48) ✅ 2
         x = self.norm1(x)  # (32, 112, 112, 48) --> (32, 112, 112, 48) ✅ 3
-        x = x.permute(0, 3, 1, 2) # (B, H, W, C) --> (B, C, H, W)  
-
-        x = self.act(x)  
+        x = x.permute(0, 3, 1, 2) # (B, H, W, C) --> (B, C, H, W)  # 将每个空间位置 (H, W) 的所有通道 C 视为一个整体（即每个位置的特征向量）。
+        # ✅ 4 (32, 48, 112, 112)
+        x = self.act(x)  # 此时归一化会对每个空间位置 (H, W) 的所有通道 C 计算统计量（如均值、方差）。
+        # ✅ 5
         ### 类比：类似于将图像展平为 H*W 个网格点，每个点有一个 C 维特征向量，然后对这些向量独立归一化。
         x = self.conv2(x)  # (32, 48, 112, 112)  --> (32, 64, 56, 56) ✅ 5
         ## output_height = (112 -3 +2)/2 + 1 = (55.5) + 1 = 56
@@ -91,9 +80,15 @@ class DownsampleLayer(nn.Module):
 
     def forward(self, x):
         x = self.conv(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)  # ✅ 1
-
+        """
+        # x.permute(0, 3, 1, 2): (B, H, W, C) --> (B, C, H, W)  (32, 64, 56, 56)
+        ## conv(x.permute(0, 3, 1, 2)) (32, 64, 56, 56) -- (32, 96, 28, 28)
+        ## out_size = (56 - 3 + 2)/2 +1 = 28
+        ### (B, C, H, W) --> (B, H, W, C)  (32, 96, 28, 28) --> (32, 28, 28, 96)
+        """
         x = self.norm(x)  # (32, 28, 28, 96) --> (32, 28, 28, 96)  # ✅ 2
         return x
+
 
 class SEAttention(nn.Module):
 
@@ -121,17 +116,21 @@ class SEAttention(nn.Module):
                 init.normal_(m.weight, std=0.001)
                 if m.bias is not None:
                     init.constant_(m.bias, 0)
-
+    #fixme 如何设计多头输入
     def forward(self, x1, x2):
-
+        # input为 downsample的output为(32, 7, 7, 565)
+        # (B, H, W, C) --> (B, C, H, W) || (32, 7, 7, 576) --> (32, 576, 7, 7)
         x1 = x1.permute(0, 3, 1, 2)  # tensor:(32, 576, 7, 7) (10, 288, 7, 7)
         x2 = x2.permute(0, 3, 1, 2)  # tensor:(32, 576, 7, 7)
         # (B,C,H,W)
         B1, C1, H1, W1 = x1.size() # 32, 576, 7, 7
         B1, C1, H1, W1 = x1.size() # 32, 576, 7, 7
+        # B2, C2, H2, W2 = x2.size() # 32, 576, 7, 7
 
-
-
+        # # 确保批次大小、通道数、高度和宽度兼容
+        # if B1 != B2 or B1 != 32 or B2 != 32:
+        #     raise ValueError(f"Input sizes do not match: x1: {x1.size()}, x2: {x2.size()}")
+        #     return None
         x = x1 + x2  # (32, 576, 7, 7) tensor值与值简单相加
         # Squeeze: (B,C,H,W)-->avg_pool-->(B,C,1,1)-->view-->(B,C)
         y = self.avg_pool(x).view(B1, C1)  # y tensor(32, 576) (10, 288)
@@ -215,7 +214,14 @@ class GatedCNNBlock(nn.Module):
         shortcut = x # [B, H, W, C] tensor(32, 56, 56, 64)
         x = self.norm(x)  # tensor(32, 56, 56, 64)
         g, i, c = torch.split(self.fc1(x), self.split_indices, dim=-1)
-
+        """
+        expansion_ratio=8/3, hidden = 8/3 * dim = 256
+        conv_ratio=1.0, conv_channels = 1 * dim = 64
+        self.split_indices = (hidden, hidden - conv_channels, conv_channels) = (256, 256-64==160, 64)
+        g = tensor:(32, 56, 56, 256)
+        i = tensor:(32, 56, 56, 160)
+        c = tensor:(32, 56, 56, 64)
+        """
         c = c.permute(0, 3, 1, 2) # [B, H, W, C] -> [B, C, H, W] || (32, 56, 56, 64) --> (32, 64, 56, 56)
         c = self.conv(c)
         c = c.permute(0, 2, 3, 1) # [B, C, H, W] -> [B, H, W, C]
@@ -230,11 +236,19 @@ def hook_fn(module, input, output):
     print(f"Output shape: {output.shape}")
     print("-" * 50)
 
-
 # fixme 这里是四个下采样层的调用顺序
 DOWNSAMPLE_LAYERS_FOUR_STAGES = [StemLayer] + [DownsampleLayer]*3
-
-#todo 所以，那现在前面就需要设置为多头输入
+"""
+    DOWNSAMPLE_LAYERS_FIVE_STAGES 
+    [__main__.StemLayer,
+     __main__.DownsampleLayer,
+     __main__.DownsampleLayer,
+     __main__.DownsampleLayer,
+     __main__.SEAttention]
+     在进行下采样时，特征图的空间分辨率会降低，这时候的特征图通常已经包含了足够的上下文信息和空间压缩效果。
+     此时使用 SEAttention 可以有效地通过通道加权来调整不同特征的重要性。SEAttention 通过全局平均池化将特征图的空间信息压缩到每个通道的权重上。
+     因此，SEAttention 的作用是基于全局信息来调整通道特征。在下采样之后，特征图的空间尺寸通常较小，便于更好地捕捉全局上下文信息
+"""
 
 class MambaOut(nn.Module):
     r""" MetaFormer
@@ -281,7 +295,6 @@ class MambaOut(nn.Module):
         self.num_stage = num_stage
 
         if not isinstance(downsample_layers, (list, tuple)):  # 判断downsample_layers是不是这两类
-
             downsample_layers = [downsample_layers] * num_stage
         down_dims = [in_chans] + dims # down_dims = [3] + [64, 192, 384, 576] = [3, 64, 192, 384, 576]
         self.downsample_layers1 = nn.ModuleList(
@@ -290,8 +303,6 @@ class MambaOut(nn.Module):
         self.downsample_layers2 = nn.ModuleList(
             [downsample_layers[i](down_dims[i], down_dims[i+1]) for i in range(num_stage)])  # 下采样层2的构建
         self.seattention_layer = SEAttention(channel=dims[-1])  # SEAttention/特征融合层构建
-
-
         dp_rates=[x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
 
         self.stages = nn.ModuleList()
@@ -332,6 +343,7 @@ class MambaOut(nn.Module):
         return {'norm'}
 
     def extract_features(self, x1, x2):
+        """提取中间层特征（例如最后一个卷积层的输出）"""
         # 前向传播到SEAttention层之前
         for i in range(self.num_stage):
             x1 = self.downsample_layers1[i](x1)  # x1 tensor(32, 3, 224, 224) --> (32, 56, 56, 64)
@@ -346,7 +358,7 @@ class MambaOut(nn.Module):
         # 获取SEAttention层输入作为特征（可选：也可在SEAttention之后提取）
         return fused_features.permute(0, 3, 1, 2).flatten(1)  # [B, C, H, W] -> [B, C*H*W]
 
-    def forward_features(self, x1, x2):  
+    def forward_features(self, x1, x2):  # forward设计，这样就可以实现特征融合了
         # 检查 x1 和 x2 的批次大小是否匹配
         if x1.size(0) != x2.size(0):
             raise ValueError(f"Input sizes do not match: x1: {x1.size()}, x2: {x2.size()}")
